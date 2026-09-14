@@ -1,5 +1,7 @@
 //! Thin GDI+ layer: antialiased shapes, text, and per-pixel-alpha layered windows.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{HWND, POINT, SIZE};
@@ -59,19 +61,64 @@ impl Drop for Gdiplus {
     }
 }
 
-static mut FONT_FAMILY: *mut GpFontFamily = null_mut();
+// GDI+ objects reused across frames. All drawing happens on the UI thread,
+// and the handful of distinct sizes is bounded, so they live for the process
+// (deliberately never freed: GDI+ is shut down before TLS teardown).
+thread_local! {
+    static FONT_FAMILY: Cell<*mut GpFontFamily> = const { Cell::new(null_mut()) };
+    static FONTS: RefCell<HashMap<(u32, bool), *mut GpFont>> = RefCell::new(HashMap::new());
+    static FORMATS: RefCell<HashMap<StringAlignment, *mut GpStringFormat>> =
+        RefCell::new(HashMap::new());
+}
 
 unsafe fn font_family() -> *mut GpFontFamily {
-    if FONT_FAMILY.is_null() {
-        let name: Vec<u16> = "Segoe UI".encode_utf16().chain(std::iter::once(0)).collect();
-        let mut family = null_mut();
-        if GdipCreateFontFamilyFromName(name.as_ptr(), null_mut(), &mut family) != 0 {
-            let fallback: Vec<u16> = "Arial".encode_utf16().chain(std::iter::once(0)).collect();
-            GdipCreateFontFamilyFromName(fallback.as_ptr(), null_mut(), &mut family);
+    FONT_FAMILY.with(|cell| {
+        if cell.get().is_null() {
+            let name: Vec<u16> = "Segoe UI"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut family = null_mut();
+            if GdipCreateFontFamilyFromName(name.as_ptr(), null_mut(), &mut family) != 0 {
+                let fallback: Vec<u16> = "Arial".encode_utf16().chain(std::iter::once(0)).collect();
+                GdipCreateFontFamilyFromName(fallback.as_ptr(), null_mut(), &mut family);
+            }
+            cell.set(family);
         }
-        FONT_FAMILY = family;
+        cell.get()
+    })
+}
+
+unsafe fn font(size: f32, bold: bool) -> *mut GpFont {
+    let family = font_family();
+    if family.is_null() {
+        return null_mut();
     }
-    FONT_FAMILY
+    FONTS.with(|fonts| {
+        *fonts
+            .borrow_mut()
+            .entry((size.to_bits(), bold))
+            .or_insert_with(|| {
+                let mut font = null_mut();
+                let style = if bold { 1 } else { 0 };
+                if GdipCreateFont(family, size, style, UnitPixel, &mut font) != 0 {
+                    font = null_mut();
+                }
+                font
+            })
+    })
+}
+
+unsafe fn string_format(align: StringAlignment) -> *mut GpStringFormat {
+    FORMATS.with(|formats| {
+        *formats.borrow_mut().entry(align).or_insert_with(|| {
+            let mut format = null_mut();
+            GdipCreateStringFormat(0, 0, &mut format);
+            GdipSetStringFormatAlign(format, align);
+            GdipSetStringFormatLineAlign(format, ALIGN_CENTER);
+            format
+        })
+    })
 }
 
 unsafe fn round_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> *mut GpPath {
@@ -126,6 +173,7 @@ impl Canvas {
         GdipDeletePath(path);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn fill_round_rect_gradient(
         &self,
         x: f32,
@@ -158,6 +206,7 @@ impl Canvas {
         GdipDeletePath(path);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn stroke_round_rect(
         &self,
         x: f32,
@@ -200,6 +249,7 @@ impl Canvas {
         GdipDeletePath(path);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn stroke_arc(
         &self,
         cx: f32,
@@ -249,19 +299,11 @@ impl Canvas {
         align: StringAlignment,
         bold: bool,
     ) {
-        let family = font_family();
-        if family.is_null() {
+        let font = font(size, bold);
+        if font.is_null() {
             return;
         }
-        let mut font = null_mut();
-        let style = if bold { 1 } else { 0 };
-        if GdipCreateFont(family, size, style, UnitPixel, &mut font) != 0 {
-            return;
-        }
-        let mut format = null_mut();
-        GdipCreateStringFormat(0, 0, &mut format);
-        GdipSetStringFormatAlign(format, align);
-        GdipSetStringFormatLineAlign(format, ALIGN_CENTER);
+        let format = string_format(align);
 
         let mut brush = null_mut();
         GdipCreateSolidFill(color, &mut brush);
@@ -284,8 +326,6 @@ impl Canvas {
         );
 
         GdipDeleteBrush(brush as *mut GpBrush);
-        GdipDeleteStringFormat(format);
-        GdipDeleteFont(font);
     }
 }
 
@@ -370,22 +410,14 @@ impl LayeredSurface {
 
     /// Pushes the top-left `width` x `height` region of the surface to the
     /// window at `alpha` overall opacity.
-    pub unsafe fn commit(
-        &self,
-        hwnd: HWND,
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-        alpha: u8,
-    ) {
+    pub unsafe fn commit(&self, hwnd: HWND, x: i32, y: i32, width: i32, height: i32, alpha: u8) {
         GdipFlush(self.graphics, FlushIntentionSync);
-        let mut pos = POINT { x, y };
-        let mut size = SIZE {
+        let pos = POINT { x, y };
+        let size = SIZE {
             cx: width.clamp(1, self.width),
             cy: height.clamp(1, self.height),
         };
-        let mut src = POINT { x: 0, y: 0 };
+        let src = POINT { x: 0, y: 0 };
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
@@ -395,10 +427,10 @@ impl LayeredSurface {
         UpdateLayeredWindow(
             hwnd,
             null_mut(),
-            &mut pos,
-            &mut size,
+            &pos,
+            &size,
             self.dc,
-            &mut src,
+            &src,
             0,
             &blend,
             ULW_ALPHA,

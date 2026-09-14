@@ -7,8 +7,11 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::config::is_autostart_enabled;
-use crate::{wide, ID_MENU_AUTOSTART, ID_MENU_EXIT, ID_MENU_SETTINGS, TRAY_ID, WM_TRAYICON};
+use crate::config::{self, is_autostart_enabled, Settings};
+use crate::{
+    settings_ui, wide, AppState, ID_MENU_AUTOSTART, ID_MENU_CHANNEL_COUNT, ID_MENU_CHANNEL_FIRST,
+    ID_MENU_EXIT, ID_MENU_MUTE, ID_MENU_SETTINGS, ID_MENU_VOICEMEETER, TRAY_ID, WM_TRAYICON,
+};
 
 /// Icon resource id emitted by build.rs (`1 ICON "assets/icon.ico"`).
 const ICON_RESOURCE_ID: u16 = 1;
@@ -60,7 +63,8 @@ pub fn icon_rect(hwnd: HWND) -> Option<RECT> {
             guidItem: std::mem::zeroed(),
         };
         let mut rc: RECT = std::mem::zeroed();
-        if Shell_NotifyIconGetRect(&id, &mut rc) != 0 || rc.right <= rc.left {
+        if Shell_NotifyIconGetRect(&id, &mut rc) != 0 || rc.right <= rc.left || rc.bottom <= rc.top
+        {
             return None;
         }
         Some(rc)
@@ -78,22 +82,7 @@ pub fn add(hwnd: HWND, icon: HICON) {
 /// overflow flyout this resolves to the chevron button, which is still where
 /// the user sees it come from.
 pub fn icon_center(hwnd: HWND) -> Option<(i32, i32)> {
-    unsafe {
-        let id = NOTIFYICONIDENTIFIER {
-            cbSize: std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
-            hWnd: hwnd,
-            uID: TRAY_ID,
-            guidItem: std::mem::zeroed(),
-        };
-        let mut rc: RECT = std::mem::zeroed();
-        if Shell_NotifyIconGetRect(&id, &mut rc) != 0 {
-            return None;
-        }
-        if rc.right <= rc.left || rc.bottom <= rc.top {
-            return None;
-        }
-        Some(((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2))
-    }
+    icon_rect(hwnd).map(|rc| ((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2))
 }
 
 pub fn remove(hwnd: HWND) {
@@ -106,19 +95,71 @@ pub fn remove(hwnd: HWND) {
     }
 }
 
-pub fn show_menu(hwnd: HWND) {
+/// Menu text with `&` escaped, so a Voicemeeter label like "Mic & Line"
+/// doesn't turn into a keyboard mnemonic.
+fn menu_text(text: &str) -> Vec<u16> {
+    wide(&text.replace('&', "&&"))
+}
+
+pub fn show_menu(hwnd: HWND, app: &AppState) {
     unsafe {
         let menu = CreatePopupMenu();
         if menu.is_null() {
             return;
         }
+        let (kind, index) = (app.settings.kind, app.settings.index);
+
+        // Mute state of the configured channel, which is what the item acts
+        // on, even if the bar is currently following another one.
+        let muted = app
+            .vmr
+            .get_float(&Settings::mute_param(kind, index))
+            .is_some_and(|m| m >= 0.5);
+        let caption = settings_ui::channel_caption(kind, index, app.edition);
+        AppendMenuW(
+            menu,
+            MF_STRING | if muted { MF_CHECKED } else { MF_UNCHECKED },
+            ID_MENU_MUTE as usize,
+            menu_text(&format!("Mute {caption}")).as_ptr(),
+        );
+
+        let channels = CreatePopupMenu();
+        if !channels.is_null() {
+            for (item, (k, i)) in config::all_channels(app.edition)
+                .into_iter()
+                .take(ID_MENU_CHANNEL_COUNT)
+                .enumerate()
+            {
+                let checked = if (k, i) == (kind, index) {
+                    MF_CHECKED
+                } else {
+                    MF_UNCHECKED
+                };
+                AppendMenuW(
+                    channels,
+                    MF_STRING | checked,
+                    ID_MENU_CHANNEL_FIRST as usize + item,
+                    menu_text(&settings_ui::channel_caption(k, i, app.edition)).as_ptr(),
+                );
+            }
+            // The menu owns the submenu once appended, and destroys it too.
+            AppendMenuW(menu, MF_POPUP, channels as usize, wide("Channel").as_ptr());
+        }
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            ID_MENU_VOICEMEETER as usize,
+            wide("Open Voicemeeter").as_ptr(),
+        );
+        AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
+
         AppendMenuW(
             menu,
             MF_STRING,
             ID_MENU_SETTINGS as usize,
             wide("Settings").as_ptr(),
         );
-        AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
+        SetMenuDefaultItem(menu, ID_MENU_SETTINGS as u32, 0);
         let autostart = if is_autostart_enabled() {
             MF_STRING | MF_CHECKED
         } else {
@@ -131,7 +172,12 @@ pub fn show_menu(hwnd: HWND) {
             wide("Start with Windows").as_ptr(),
         );
         AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
-        AppendMenuW(menu, MF_STRING, ID_MENU_EXIT as usize, wide("Exit").as_ptr());
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            ID_MENU_EXIT as usize,
+            wide("Exit").as_ptr(),
+        );
 
         let mut pt = POINT { x: 0, y: 0 };
         GetCursorPos(&mut pt);

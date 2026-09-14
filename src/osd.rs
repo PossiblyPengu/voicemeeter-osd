@@ -14,6 +14,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::{Orientation, Position, Settings};
 use crate::gfx::{argb, shade, tint, Canvas, LayeredSurface, ALIGN_CENTER, ALIGN_NEAR};
+use crate::scale::{ease_out_cubic, format_db, gain_fraction};
 use crate::{state, AppState};
 
 pub const CLASS_NAME: &str = "VoicemeeterOsdBarClass";
@@ -30,11 +31,10 @@ fn has_tail(settings: &Settings) -> bool {
     settings.position == Position::AboveTray
 }
 
-
 /// Full window size including shadow padding and tail, in physical pixels.
 pub fn size_for(settings: &Settings, dpi: i32) -> (i32, i32) {
     let (w, h) = match settings.orientation {
-        Orientation::Vertical => (60, 226),
+        Orientation::Vertical => (66, 226),
         Orientation::Horizontal => (300, 86),
     };
     let pad = SHADOW * 2;
@@ -86,6 +86,12 @@ unsafe fn metrics_of(monitor: HMONITOR) -> MonitorInfo {
     }
 }
 
+/// True when the user has actually dragged the bar somewhere; `custom_(0,0)`
+/// is the never-dragged sentinel, which behaves like Centre.
+fn custom_is_set(settings: &Settings) -> bool {
+    settings.custom_x != 0 || settings.custom_y != 0
+}
+
 /// Picks the display to show on: the one owning the tray icon when docked,
 /// otherwise the one the user is actually working on.
 pub fn resolve_monitor(settings: &Settings, tray_point: Option<(i32, i32)>) -> MonitorInfo {
@@ -95,7 +101,14 @@ pub fn resolve_monitor(settings: &Settings, tray_point: Option<(i32, i32)>) -> M
                 Some((x, y)) => MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST),
                 None => MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY),
             },
-            Position::Centre => {
+            Position::Custom if custom_is_set(settings) => MonitorFromPoint(
+                POINT {
+                    x: settings.custom_x,
+                    y: settings.custom_y,
+                },
+                MONITOR_DEFAULTTONEAREST,
+            ),
+            Position::Centre | Position::Custom => {
                 let foreground = GetForegroundWindow();
                 if !foreground.is_null() {
                     MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST)
@@ -140,9 +153,23 @@ pub fn origin_for(
             };
             (x, y)
         }
+        Position::Custom if custom_is_set(settings) => {
+            // Saved coordinates can outlive the display they were set on;
+            // keep enough of the card on screen to grab it back.
+            let wa = monitor.work;
+            let visible = 48 * dpi / 96;
+            let min_x = wa.left - w + visible;
+            let max_x = wa.right - visible;
+            let min_y = wa.top - h + visible;
+            let max_y = wa.bottom - visible;
+            (
+                settings.custom_x.clamp(min_x.min(max_x), max_x),
+                settings.custom_y.clamp(min_y.min(max_y), max_y),
+            )
+        }
         // Horizontally centred but sitting low, so it floats clear of
         // whatever you're actually looking at instead of covering it.
-        Position::Centre => {
+        Position::Centre | Position::Custom => {
             let wa = monitor.work;
             let x = wa.left + (wa.right - wa.left - w) / 2;
             let y = wa.bottom - h - (wa.bottom - wa.top) / 8;
@@ -180,7 +207,11 @@ pub unsafe fn render(app: &mut AppState) {
 
     let vertical = app.settings.orientation == Orientation::Vertical;
     let pad = s(SHADOW as f32);
-    let tail_h = if has_tail(&app.settings) { s(TAIL_H as f32) } else { 0.0 };
+    let tail_h = if has_tail(&app.settings) {
+        s(TAIL_H as f32)
+    } else {
+        0.0
+    };
     let card_w = surface.width as f32 - pad * 2.0;
     let card_h = surface.height as f32 - pad * 2.0 - tail_h;
     let radius = s(if vertical { 22.0 } else { 16.0 });
@@ -269,9 +300,15 @@ pub unsafe fn render(app: &mut AppState) {
 /// rather than from nothing.
 const MIN_SCALE: f32 = 0.28;
 
-fn ease_out_cubic(t: f32) -> f32 {
-    let inv = 1.0 - t;
-    1.0 - inv * inv * inv
+/// Green through amber to red as the signal approaches clipping.
+fn meter_color(level: f32) -> u32 {
+    if level > 0.96 {
+        argb(255, 240, 80, 70)
+    } else if level > 0.88 {
+        argb(255, 235, 175, 70)
+    } else {
+        argb(255, 110, 205, 130)
+    }
 }
 
 /// True when a game or presentation is filling a screen, so a topmost
@@ -287,7 +324,7 @@ pub fn fullscreen_foreground() -> bool {
         // Borderless-fullscreen windows don't set that state, so also check
         // whether the active window covers its entire monitor.
         let foreground = GetForegroundWindow();
-        if foreground.is_null() || foreground == GetShellWindow() {
+        if foreground.is_null() || foreground == GetShellWindow() || is_desktop(foreground) {
             return false;
         }
         let mut rc: RECT = std::mem::zeroed();
@@ -300,6 +337,15 @@ pub fn fullscreen_foreground() -> bool {
             && rc.right >= monitor.full.right
             && rc.bottom >= monitor.full.bottom
     }
+}
+
+/// The desktop is a monitor-sized window too: clicking the wallpaper focuses
+/// `WorkerW` (or `Progman`), which must not count as a fullscreen app.
+unsafe fn is_desktop(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
+    let mut buf = [0u16; 32];
+    let len = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+    let class = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
+    class == "WorkerW" || class == "Progman"
 }
 
 /// Callout tail below the card. Drawn a touch above the card's edge so it
@@ -388,7 +434,8 @@ unsafe fn draw_vertical(
     );
 
     let track_w = s(10.0);
-    let track_x = cx - track_w / 2.0;
+    // Centre the track+meter pair as a group, not the track alone.
+    let track_x = cx - s(10.5);
     let track_top = pad + s(58.0);
     let track_bottom = pad + card_h - s(42.0);
     let track_h = track_bottom - track_top;
@@ -401,10 +448,62 @@ unsafe fn draw_vertical(
         argb(38, 255, 255, 255),
     );
 
+    // Live signal meter alongside the fader, so you can see level as well as
+    // the setting.
+    let meter_w = s(4.0);
+    let meter_x = track_x + track_w + s(7.0);
+    canvas.fill_round_rect(
+        meter_x,
+        track_top,
+        meter_w,
+        track_h,
+        meter_w / 2.0,
+        argb(30, 255, 255, 255),
+    );
+    let meter_h = track_h * app.meter.clamp(0.0, 1.0);
+    if meter_h > 0.5 {
+        canvas.fill_round_rect(
+            meter_x,
+            track_bottom - meter_h,
+            meter_w,
+            meter_h,
+            meter_w / 2.0,
+            meter_color(app.meter),
+        );
+    }
+    if app.meter_peak > 0.02 {
+        let y = track_bottom - track_h * app.meter_peak.clamp(0.0, 1.0);
+        canvas.fill_round_rect(
+            meter_x,
+            y - s(1.0),
+            meter_w,
+            s(2.0),
+            s(1.0),
+            meter_color(app.meter_peak),
+        );
+    }
+
+    // Unity tick: shows at a glance whether you're above or below 0 dB.
+    if app.settings.min_db < 0.0 && app.settings.max_db > 0.0 {
+        let unity = gain_fraction(0.0, app.settings.min_db, app.settings.max_db);
+        let y = track_bottom - track_h * unity;
+        canvas.fill_round_rect(
+            track_x - s(5.0),
+            y - s(0.5),
+            track_w + s(10.0),
+            s(1.0),
+            0.0,
+            argb(70, 255, 255, 255),
+        );
+    }
+
     let fill_h = track_h * pct;
     if fill_h > 0.5 {
         let (top_color, bottom_color) = if app.muted {
-            (tint(shade((150, 62, 62), 0.25), 255), tint((150, 62, 62), 255))
+            (
+                tint(shade((150, 62, 62), 0.25), 255),
+                tint((150, 62, 62), 255),
+            )
         } else {
             (tint(shade(accent, 0.28), 255), tint(accent, 255))
         };
@@ -463,13 +562,6 @@ unsafe fn draw_vertical(
     }
 }
 
-pub fn format_db(gain: Option<f32>) -> String {
-    match gain {
-        Some(g) => format!("{g:.1} dB"),
-        None => String::new(),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 unsafe fn draw_horizontal(
     canvas: &Canvas,
@@ -518,10 +610,61 @@ unsafe fn draw_horizontal(
         argb(38, 255, 255, 255),
     );
 
+    if app.settings.min_db < 0.0 && app.settings.max_db > 0.0 {
+        let unity = gain_fraction(0.0, app.settings.min_db, app.settings.max_db);
+        let x = track_left + track_w * unity;
+        canvas.fill_round_rect(
+            x - s(0.5),
+            track_y - s(5.0),
+            s(1.0),
+            track_h + s(10.0),
+            0.0,
+            argb(70, 255, 255, 255),
+        );
+    }
+
+    // Live signal meter under the fader, with the same peak-hold behaviour
+    // as the vertical layout.
+    let meter_h = s(4.0);
+    let meter_y = track_y + track_h + s(8.0);
+    canvas.fill_round_rect(
+        track_left,
+        meter_y,
+        track_w,
+        meter_h,
+        meter_h / 2.0,
+        argb(30, 255, 255, 255),
+    );
+    let meter_w = track_w * app.meter.clamp(0.0, 1.0);
+    if meter_w > 0.5 {
+        canvas.fill_round_rect(
+            track_left,
+            meter_y,
+            meter_w,
+            meter_h,
+            meter_h / 2.0,
+            meter_color(app.meter),
+        );
+    }
+    if app.meter_peak > 0.02 {
+        let x = track_left + track_w * app.meter_peak.clamp(0.0, 1.0);
+        canvas.fill_round_rect(
+            x - s(1.0),
+            meter_y - s(1.0),
+            s(2.0),
+            meter_h + s(2.0),
+            s(1.0),
+            meter_color(app.meter_peak),
+        );
+    }
+
     let fill_w = track_w * pct;
     if fill_w > 0.5 {
         let (left_color, right_color) = if app.muted {
-            (tint((150, 62, 62), 255), tint(shade((150, 62, 62), 0.25), 255))
+            (
+                tint((150, 62, 62), 255),
+                tint(shade((150, 62, 62), 0.25), 255),
+            )
         } else {
             (tint(accent, 255), tint(shade(accent, 0.28), 255))
         };
@@ -636,7 +779,14 @@ pub unsafe fn draw_preview(canvas: &Canvas, settings: &Settings, x: f32, y: f32,
         let track_left = x + 34.0;
         let track_w = w - 76.0;
         let track_y = y + h / 2.0 - track_h / 2.0;
-        draw_speaker(canvas, x + 20.0, y + h / 2.0, 16.0, muted, argb(230, 255, 255, 255));
+        draw_speaker(
+            canvas,
+            x + 20.0,
+            y + h / 2.0,
+            16.0,
+            muted,
+            argb(230, 255, 255, 255),
+        );
         canvas.fill_round_rect(
             track_left,
             track_y,
@@ -665,5 +815,48 @@ pub unsafe fn draw_preview(canvas: &Canvas, settings: &Settings, x: f32, y: f32,
             ALIGN_CENTER,
             true,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn monitor() -> MonitorInfo {
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        MonitorInfo {
+            work: area,
+            full: area,
+            dpi: 96,
+        }
+    }
+
+    #[test]
+    fn offscreen_custom_position_is_pulled_back() {
+        let mut settings = Settings::default();
+        settings.position = Position::Custom;
+        settings.custom_x = -3000;
+        settings.custom_y = 4000;
+        let (x, y) = origin_for(&settings, 96, &monitor(), None);
+        let (w, h) = size_for(&settings, 96);
+        let wa = monitor().work;
+        assert!(x + w >= wa.left + 48);
+        assert!(x <= wa.right - 48);
+        assert!(y + h >= wa.top + 48);
+        assert!(y <= wa.bottom - 48);
+    }
+
+    #[test]
+    fn onscreen_custom_position_is_untouched() {
+        let mut settings = Settings::default();
+        settings.position = Position::Custom;
+        settings.custom_x = 300;
+        settings.custom_y = 200;
+        assert_eq!(origin_for(&settings, 96, &monitor(), None), (300, 200));
     }
 }

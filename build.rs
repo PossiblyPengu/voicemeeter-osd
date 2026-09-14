@@ -23,7 +23,47 @@ fn main() {
 
     let ico = std::fs::canonicalize("assets/icon.ico").expect("assets/icon.ico missing");
     let ico = ico.to_string_lossy().replace(r"\\?\", "");
-    std::fs::write(&rc_path, format!("1 ICON \"{}\"\n", ico.replace('\\', "\\\\"))).unwrap();
+
+    // File metadata shown in Explorer / used by SmartScreen.
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
+    let mut parts: Vec<u32> = version.split('.').filter_map(|p| p.parse().ok()).collect();
+    parts.resize(4, 0);
+    let commas = format!("{},{},{},{}", parts[0], parts[1], parts[2], parts[3]);
+
+    let rc_script = format!(
+        "1 ICON \"{ico}\"\n\
+         1 VERSIONINFO\n\
+         FILEVERSION {commas}\n\
+         PRODUCTVERSION {commas}\n\
+         FILEFLAGSMASK 0x3fL\n\
+         FILEFLAGS 0x0L\n\
+         FILEOS 0x40004L\n\
+         FILETYPE 0x1L\n\
+         FILESUBTYPE 0x0L\n\
+         BEGIN\n\
+         \x20   BLOCK \"StringFileInfo\"\n\
+         \x20   BEGIN\n\
+         \x20       BLOCK \"040904b0\"\n\
+         \x20       BEGIN\n\
+         \x20           VALUE \"FileDescription\", \"Voicemeeter OSD\\0\"\n\
+         \x20           VALUE \"FileVersion\", \"{version}.0\\0\"\n\
+         \x20           VALUE \"InternalName\", \"voicemeeter-osd\\0\"\n\
+         \x20           VALUE \"LegalCopyright\", \"\\0\"\n\
+         \x20           VALUE \"OriginalFilename\", \"voicemeeter-osd.exe\\0\"\n\
+         \x20           VALUE \"ProductName\", \"Voicemeeter OSD\\0\"\n\
+         \x20           VALUE \"ProductVersion\", \"{version}.0\\0\"\n\
+         \x20       END\n\
+         \x20   END\n\
+         \x20   BLOCK \"VarFileInfo\"\n\
+         \x20   BEGIN\n\
+         \x20       VALUE \"Translation\", 0x409, 1200\n\
+         \x20   END\n\
+         END\n",
+        ico = ico.replace('\\', "\\\\"),
+        commas = commas,
+        version = version,
+    );
+    std::fs::write(&rc_path, rc_script).unwrap();
 
     let status = Command::new(&rc)
         .arg("/nologo")

@@ -1,6 +1,6 @@
 [package]
 name = "voicemeeter-osd"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [[bin]]
@@ -23,6 +23,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Graphics_GdiPlus",
     "Win32_Graphics_Dwm",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 [profile.release]
