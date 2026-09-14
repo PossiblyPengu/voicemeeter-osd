@@ -6,7 +6,10 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::Controls::Dialogs::{
     ChooseColorW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
 };
-use windows_sys::Win32::UI::Controls::{SetWindowTheme, DRAWITEMSTRUCT};
+use windows_sys::Win32::UI::Controls::{
+    SetWindowTheme, BST_CHECKED, BST_UNCHECKED, CDDS_PREPAINT, CDIS_FOCUS, CDIS_SHOWKEYBOARDCUES,
+    CDRF_DODEFAULT, CDRF_SKIPDEFAULT, DRAWITEMSTRUCT, NMCUSTOMDRAW, NMHDR, NM_CUSTOMDRAW,
+};
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -61,6 +64,15 @@ const ID_CHK_WATCH: i32 = 3019;
 const ID_CHK_HOTKEYS: i32 = 3020;
 const ID_CHK_DEBUG: i32 = 3021;
 const ID_CHK_SCROLL: i32 = 3023;
+const TOGGLE_IDS: [i32; 7] = [
+    ID_CHK_AUTOSTART,
+    ID_CHK_ACCENT_SYS,
+    ID_CHK_FULLSCREEN,
+    ID_CHK_WATCH,
+    ID_CHK_HOTKEYS,
+    ID_CHK_DEBUG,
+    ID_CHK_SCROLL,
+];
 
 /// Section captions get the dimmed text color.
 const ID_SECTION_FIRST: i32 = 3100;
@@ -752,6 +764,7 @@ unsafe fn build_controls(hwnd: HWND, ui: &mut Ui) -> i32 {
         );
     }
 
+    sync_toggle_checks(hwnd, ui);
     ui.px(y + 34 + 20)
 }
 
@@ -766,15 +779,16 @@ unsafe fn edit(parent: HWND, ui: &Ui, text: &str, numeric: bool, x: i32, y: i32,
     themed(h, "DarkMode_CFD");
 }
 
-/// A switch. `name` isn't drawn (the label beside it is), but it's the
-/// button's window text, which is what screen readers announce.
+/// A switch. It's a real checkbox underneath, painted over in custom draw,
+/// so screen readers announce it as a checkbox with its on/off state.
+/// `name` isn't drawn (the label beside it is), but it's what they read out.
 unsafe fn toggle_control(parent: HWND, ui: &Ui, name: &str, x: i32, y: i32, id: i32) {
     control(
         parent,
         ui,
         "BUTTON",
         name,
-        BS_OWNERDRAW as u32,
+        BS_CHECKBOX as u32,
         x,
         y,
         46,
@@ -821,6 +835,17 @@ unsafe fn destroy_controls(hwnd: HWND, ui: &mut Ui) {
     }
 }
 
+/// Mirrors the pending toggle values into the checkboxes' checked state,
+/// which is what accessibility tools read.
+unsafe fn sync_toggle_checks(hwnd: HWND, ui: &mut Ui) {
+    for id in TOGGLE_IDS {
+        if let Some(on) = ui.toggle(id).map(|flag| *flag) {
+            let state = if on { BST_CHECKED } else { BST_UNCHECKED };
+            SendMessageW(GetDlgItem(hwnd, id), BM_SETCHECK, state as WPARAM, 0);
+        }
+    }
+}
+
 unsafe fn invalidate_segments(hwnd: HWND) {
     for (base, count) in SEG_GROUPS {
         for i in 0..count as i32 {
@@ -860,6 +885,7 @@ unsafe fn repopulate(hwnd: HWND, ui: &mut Ui, s: &Settings) {
     if let Some(item) = ui.channels.iter().position(|c| *c == (s.kind, s.index)) {
         SendMessageW(GetDlgItem(hwnd, ID_COMBO_CHANNEL), CB_SETCURSEL, item, 0);
     }
+    sync_toggle_checks(hwnd, ui);
     InvalidateRect(hwnd, null_mut(), 1);
     let mut child = GetWindow(hwnd, GW_CHILD);
     while !child.is_null() {
@@ -1189,23 +1215,29 @@ unsafe fn button_label(dis: *const DRAWITEMSTRUCT) -> String {
     String::from_utf16_lossy(&text[..len.max(0) as usize])
 }
 
-/// Outline for the control that has keyboard focus. Owner-drawn buttons get
-/// no focus indication from Windows, so without this, tabbing through the
-/// window shows nothing. Hidden until the keyboard is used, like native
-/// controls (ODS_NOFOCUSRECT).
+/// Whether an owner-drawn control should show its focus outline: it has
+/// focus, and keyboard cues aren't hidden (ODS_NOFOCUSRECT), like native
+/// controls that only show focus once the keyboard is used.
+unsafe fn owner_focus_visible(dis: *const DRAWITEMSTRUCT) -> bool {
+    let state = (*dis).itemState;
+    state & ODS_FOCUS != 0 && state & ODS_NOFOCUSRECT == 0
+}
+
+/// Outline for the control that has keyboard focus. Custom-drawn controls
+/// get no focus indication from Windows, so without this, tabbing through
+/// the window shows nothing.
 #[allow(clippy::too_many_arguments)]
 unsafe fn draw_focus(
     ui: &Ui,
     canvas: &Canvas,
-    dis: *const DRAWITEMSTRUCT,
+    visible: bool,
     x: f32,
     y: f32,
     w: f32,
     h: f32,
     radius: f32,
 ) {
-    let state = (*dis).itemState;
-    if state & ODS_FOCUS == 0 || state & ODS_NOFOCUSRECT != 0 {
+    if !visible {
         return;
     }
     let inset = ui.s(1.0);
@@ -1248,16 +1280,25 @@ unsafe fn draw_segment(ui: &Ui, dis: *const DRAWITEMSTRUCT, selected: bool) {
         ALIGN_CENTER,
         selected,
     );
-    draw_focus(ui, &canvas, dis, 0.0, 0.0, w, h, h / 2.0);
+    draw_focus(
+        ui,
+        &canvas,
+        owner_focus_visible(dis),
+        0.0,
+        0.0,
+        w,
+        h,
+        h / 2.0,
+    );
 }
 
-unsafe fn draw_toggle(ui: &Ui, dis: *const DRAWITEMSTRUCT, on: bool) {
-    let rc = (*dis).rcItem;
+/// Paints a switch over a checkbox during its custom draw.
+unsafe fn draw_toggle(ui: &Ui, hdc: HDC, rc: RECT, on: bool, focus_visible: bool) {
     let w = (rc.right - rc.left) as f32;
     let h = (rc.bottom - rc.top) as f32;
-    let canvas = Canvas::from_hdc((*dis).hDC);
+    let canvas = Canvas::from_hdc(hdc);
 
-    FillRect((*dis).hDC, &rc, ui.bg_brush);
+    FillRect(hdc, &rc, ui.bg_brush);
 
     let track_h = h * 0.78;
     let track_y = (h - track_h) / 2.0;
@@ -1289,7 +1330,16 @@ unsafe fn draw_toggle(ui: &Ui, dis: *const DRAWITEMSTRUCT, on: bool) {
         knob,
         argb(255, 255, 255, 255),
     );
-    draw_focus(ui, &canvas, dis, 0.0, track_y, w, track_h, track_h / 2.0);
+    draw_focus(
+        ui,
+        &canvas,
+        focus_visible,
+        0.0,
+        track_y,
+        w,
+        track_h,
+        track_h / 2.0,
+    );
 }
 
 unsafe fn draw_button(ui: &Ui, dis: *const DRAWITEMSTRUCT) {
@@ -1356,7 +1406,16 @@ unsafe fn draw_button(ui: &Ui, dis: *const DRAWITEMSTRUCT) {
             primary,
         );
     }
-    draw_focus(ui, &canvas, dis, 0.0, 0.0, w, h, radius);
+    draw_focus(
+        ui,
+        &canvas,
+        owner_focus_visible(dis),
+        0.0,
+        0.0,
+        w,
+        h,
+        radius,
+    );
 }
 
 unsafe fn on_command(hwnd: HWND, ui: &mut Ui, id: i32, notification: u32) {
@@ -1415,6 +1474,7 @@ unsafe fn on_command(hwnd: HWND, ui: &mut Ui, id: i32, notification: u32) {
             if let Some(flag) = ui.toggle(id) {
                 *flag = !*flag;
             }
+            sync_toggle_checks(hwnd, ui);
             if id == ID_CHK_ACCENT_SYS {
                 // Every accent-coloured control changes with this one.
                 InvalidateRect(hwnd, null_mut(), 0);
@@ -1549,12 +1609,29 @@ pub unsafe extern "system" fn wndproc(
             let id = (*dis).CtlID as i32;
             if let Some((group, base, _)) = seg_group_of(id) {
                 draw_segment(ui, dis, ui.segment(group) == (id - base) as usize);
-            } else if let Some(on) = ui.toggle(id).map(|flag| *flag) {
-                draw_toggle(ui, dis, on);
             } else {
                 draw_button(ui, dis);
             }
             1
+        }
+        WM_NOTIFY => {
+            let hdr = lparam as *const NMHDR;
+            if hdr.is_null() || (*hdr).code != NM_CUSTOMDRAW {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            let id = (*hdr).idFrom as i32;
+            let Some(on) = ui.toggle(id).map(|flag| *flag) else {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            };
+            let cd = lparam as *const NMCUSTOMDRAW;
+            if (*cd).dwDrawStage != CDDS_PREPAINT {
+                return CDRF_DODEFAULT as LRESULT;
+            }
+            let item = (*cd).uItemState;
+            let focus_visible = item & CDIS_FOCUS != 0 && item & CDIS_SHOWKEYBOARDCUES != 0;
+            draw_toggle(ui, (*cd).hdc, (*cd).rc, on, focus_visible);
+            // The checkbox's own box and caption would draw over the switch.
+            CDRF_SKIPDEFAULT as LRESULT
         }
         WM_COMMAND => {
             let id = (wparam & 0xFFFF) as i32;
