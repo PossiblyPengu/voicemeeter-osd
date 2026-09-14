@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Keeps workflow actions current, so runtime deprecations (like Node 20)
+  # arrive as a PR instead of a warning on a release run.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
