@@ -59,37 +59,42 @@ impl Hotkey {
         format!("{}:{}", self.mods, self.vk)
     }
 
-    /// From a hotkey control's `HKM_GETHOTKEY` word: low byte is the key,
-    /// high byte is HOTKEYF_SHIFT(1) / CONTROL(2) / ALT(4) / EXT(8).
-    pub fn from_control(word: u32) -> Hotkey {
-        let vk = word & 0xFF;
-        let flags = (word >> 8) & 0xFF;
-        let mut mods = 0;
-        for (flag, m) in [(1, MOD_SHIFT), (2, MOD_CONTROL), (4, MOD_ALT)] {
-            if flags & flag != 0 {
-                mods |= m;
-            }
-        }
-        Hotkey { mods, vk }
+    /// Shift, Ctrl, Alt and Win, left, right or either. Pressing one of
+    /// these alone isn't a shortcut yet, just the start of one.
+    pub fn is_modifier_key(vk: u32) -> bool {
+        matches!(vk, 0x10..=0x12 | 0x5B | 0x5C | 0xA0..=0xA5)
     }
 
-    /// Word for `HKM_SETHOTKEY`. Navigation keys need the extended flag or
-    /// the control names them after the numpad ("Num 8" instead of "Up").
-    pub fn to_control(self) -> u32 {
-        let mut flags = 0;
-        for (m, flag) in [(MOD_SHIFT, 1), (MOD_CONTROL, 2), (MOD_ALT, 4)] {
-            if self.mods & m != 0 {
-                flags |= flag;
-            }
+    /// Keys that make sense as a shortcut on their own: F13-F24, which
+    /// nothing else uses, and the volume/media keys, which is how a
+    /// keyboard's own volume keys get pointed at Voicemeeter. Any other bare
+    /// key would hijack normal typing.
+    pub fn allowed_bare(vk: u32) -> bool {
+        matches!(vk, 0x7C..=0x87 | 0xA6..=0xB7)
+    }
+
+    /// Builds the shortcut for a key pressed with `mods` held, promoting a
+    /// bare ordinary key to Ctrl+Alt. `None` while only modifiers are down.
+    pub fn from_press(vk: u32, mods: u32) -> Option<Hotkey> {
+        if vk == 0 || vk > 0xFF || Hotkey::is_modifier_key(vk) {
+            return None;
         }
-        if matches!(self.vk, 0x21..=0x28 | 0x2D | 0x2E) {
-            flags |= 8;
-        }
-        (flags << 8) | (self.vk & 0xFF)
+        let mods = if mods == 0 && !Hotkey::allowed_bare(vk) {
+            MOD_CONTROL | MOD_ALT
+        } else {
+            mods
+        };
+        Some(Hotkey { mods, vk })
     }
 
     /// Human-readable form for logs and tooltips.
     pub fn describe(&self) -> String {
+        self.describe_with(|_| None)
+    }
+
+    /// Like `describe`, asking `key_name` for keys without a built-in name
+    /// (the UI passes the keyboard layout's own names).
+    pub fn describe_with(&self, key_name: impl Fn(u32) -> Option<String>) -> String {
         if !self.is_set() {
             return "None".to_string();
         }
@@ -104,18 +109,38 @@ impl Hotkey {
                 parts.push(name.to_string());
             }
         }
+        let named = |s: &str| s.to_string();
         parts.push(match self.vk {
-            0x26 => "Up".to_string(),
-            0x28 => "Down".to_string(),
-            0x25 => "Left".to_string(),
-            0x27 => "Right".to_string(),
-            0x21 => "PgUp".to_string(),
-            0x22 => "PgDn".to_string(),
+            0x08 => named("Backspace"),
+            0x09 => named("Tab"),
+            0x0D => named("Enter"),
+            0x13 => named("Pause"),
+            0x1B => named("Esc"),
+            0x20 => named("Space"),
+            0x21 => named("PgUp"),
+            0x22 => named("PgDn"),
+            0x23 => named("End"),
+            0x24 => named("Home"),
+            0x25 => named("Left"),
+            0x26 => named("Up"),
+            0x27 => named("Right"),
+            0x28 => named("Down"),
+            0x2C => named("PrtSc"),
+            0x2D => named("Ins"),
+            0x2E => named("Del"),
+            0x60..=0x69 => format!("Num {}", self.vk - 0x60),
             0x70..=0x87 => format!("F{}", self.vk - 0x6F),
+            0xAD => named("Mute"),
+            0xAE => named("Volume Down"),
+            0xAF => named("Volume Up"),
+            0xB0 => named("Next Track"),
+            0xB1 => named("Previous Track"),
+            0xB2 => named("Stop"),
+            0xB3 => named("Play/Pause"),
             v if (0x30..=0x39).contains(&v) || (0x41..=0x5A).contains(&v) => {
                 char::from(v as u8).to_string()
             }
-            v => format!("#{v}"),
+            v => key_name(v).unwrap_or_else(|| format!("Key {v}")),
         });
         parts.join("+")
     }
@@ -700,14 +725,40 @@ mod tests {
     }
 
     #[test]
-    fn hotkey_control_words_round_trip() {
-        let up = Settings::default().hotkey_up;
-        // Ctrl(2) | Alt(4) | Ext(8) in the high byte, VK_UP low.
-        assert_eq!(up.to_control(), 0x0E26);
-        assert_eq!(Hotkey::from_control(up.to_control()), up);
-        let mute = Settings::default().hotkey_mute;
-        assert_eq!(mute.to_control(), 0x064D);
-        assert_eq!(Hotkey::from_control(0), Hotkey::NONE);
+    fn modifier_presses_are_not_shortcuts_yet() {
+        for vk in [0x10, 0x11, 0x12, 0x5B, 0xA0, 0xA5] {
+            assert_eq!(Hotkey::from_press(vk, MOD_CONTROL), None);
+        }
+    }
+
+    #[test]
+    fn bare_ordinary_keys_get_ctrl_alt() {
+        let key = Hotkey::from_press('K' as u32, 0).unwrap();
+        assert_eq!(key.mods, MOD_CONTROL | MOD_ALT);
+        let shifted = Hotkey::from_press('K' as u32, MOD_SHIFT).unwrap();
+        assert_eq!(shifted.mods, MOD_SHIFT);
+    }
+
+    #[test]
+    fn media_and_high_function_keys_can_stand_alone() {
+        assert_eq!(Hotkey::from_press(0xAF, 0).unwrap().mods, 0); // Volume Up
+        assert_eq!(Hotkey::from_press(0x7C, 0).unwrap().mods, 0); // F13
+        assert_eq!(
+            Hotkey::from_press(0x70, 0).unwrap().mods,
+            MOD_CONTROL | MOD_ALT
+        ); // F1
+    }
+
+    #[test]
+    fn unknown_keys_use_the_supplied_name() {
+        let oem = Hotkey {
+            mods: MOD_CONTROL,
+            vk: 0xBA,
+        };
+        assert_eq!(oem.describe(), "Ctrl+Key 186");
+        assert_eq!(oem.describe_with(|_| Some(";".into())), "Ctrl+;");
+        let vol = Hotkey { mods: 0, vk: 0xAE };
+        assert_eq!(vol.describe(), "Volume Down");
     }
 
     #[test]

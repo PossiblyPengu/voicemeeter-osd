@@ -1103,7 +1103,6 @@ fn main() {
             if !settings.is_null() {
                 match settings_ui::route_key(settings, &msg) {
                     settings_ui::KeyRoute::Handled => continue,
-                    settings_ui::KeyRoute::Raw => {}
                     settings_ui::KeyRoute::Dialog => {
                         if IsDialogMessageW(settings, &msg) != 0 {
                             continue;

@@ -24,10 +24,12 @@ or every channel at once, if you'd rather it follow whichever fader moved.
 - **Reads the level, the dB value and the channel name** — using the label you typed in Voicemeeter
   if you set one, otherwise `A1`, `B2`, `Strip 3` and so on.
 - **Scroll the tray icon** to change the volume, or use global hotkeys — by default
-  `Ctrl+Alt+↑` / `Ctrl+Alt+↓` nudge the fader and `Ctrl+Alt+M` toggles mute, and all three can be
-  rebound (Backspace clears one). You're warned if another app already owns a shortcut. The step
-  per notch or press is adjustable. Scrolling and hotkeys always act on the channel you picked in
-  settings, even when the bar is following another one.
+  `Ctrl+Alt+↑` / `Ctrl+Alt+↓` nudge the fader and `Ctrl+Alt+M` toggles mute. To rebind one, click
+  its field and press the new combination (Backspace clears it). Your keyboard's own volume and
+  media keys can be bound on their own, which points them at Voicemeeter instead of Windows. You're
+  warned if another app already owns a shortcut. The step per notch or press is adjustable.
+  Scrolling and hotkeys always act on the channel you picked in settings, even when the bar is
+  following another one.
 - **Click the bar** to bring up the Voicemeeter window, **scroll over it** to adjust, or
   **middle-click** to mute. Hovering keeps it on screen. Precision touchpads scroll smoothly too.
 - **Right-click the tray icon** to mute, switch channel or open Voicemeeter without going into

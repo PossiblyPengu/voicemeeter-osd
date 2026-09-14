@@ -30,13 +30,6 @@ const ODS_NOFOCUSRECT: u32 = 0x0200;
 const ODT_BUTTON: u32 = 4;
 const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
 const EM_SETSEL: u32 = 0x00B1;
-const HOTKEY_CLASS: &str = "msctls_hotkey32";
-const HKM_SETHOTKEY: u32 = WM_USER + 1;
-const HKM_GETHOTKEY: u32 = WM_USER + 2;
-const HKM_SETRULES: u32 = WM_USER + 3;
-const HKCOMB_NONE: usize = 0x0001;
-const HKCOMB_S: usize = 0x0002;
-const HOTKEYF_CONTROL_ALT: isize = 0x02 | 0x04;
 
 const ID_COMBO_CHANNEL: i32 = 3001;
 const ID_BTN_COLOR: i32 = 3006;
@@ -112,6 +105,9 @@ struct Ui {
     bg_brush: HBRUSH,
     field_brush: HBRUSH,
     preview_rect: RECT,
+    /// Backgrounds painted behind the text boxes, which sit inset within
+    /// them so their text has padding instead of hugging the top edge.
+    fields: Vec<RECT>,
 }
 
 impl Ui {
@@ -132,6 +128,15 @@ impl Ui {
             ID_CHK_HOTKEYS => &mut self.pending.hotkeys_enabled,
             ID_CHK_DEBUG => &mut self.pending.debug_log,
             ID_CHK_SCROLL => &mut self.pending.tray_scroll,
+            _ => return None,
+        })
+    }
+
+    fn hotkey(&mut self, id: i32) -> Option<&mut Hotkey> {
+        Some(match id {
+            ID_HK_UP => &mut self.pending.hotkey_up,
+            ID_HK_DOWN => &mut self.pending.hotkey_down,
+            ID_HK_MUTE => &mut self.pending.hotkey_mute,
             _ => return None,
         })
     }
@@ -227,47 +232,99 @@ pub fn open(hinstance: windows_sys::Win32::Foundation::HINSTANCE) {
 pub enum KeyRoute {
     /// Fully handled here; don't dispatch it.
     Handled,
-    /// Dispatch straight to the control, bypassing dialog navigation, so a
-    /// shortcut picker can record Enter instead of it pressing Save.
-    Raw,
     /// Normal dialog handling (Tab, Enter, Esc).
     Dialog,
 }
 
+/// While a shortcut field has focus, keystrokes are recorded into it rather
+/// than typed or used for navigation. Tab still moves on, Esc still closes,
+/// and Backspace or Delete on its own clears the shortcut.
 pub fn route_key(settings: HWND, msg: &MSG) -> KeyRoute {
     unsafe {
-        if msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN {
+        let down = matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN);
+        let other_key = matches!(msg.message, WM_KEYUP | WM_SYSKEYUP | WM_CHAR | WM_SYSCHAR);
+        if !down && !other_key {
             return KeyRoute::Dialog;
         }
         let focus = GetFocus();
         if focus.is_null() || GetParent(focus) != settings {
             return KeyRoute::Dialog;
         }
-        if !matches!(GetDlgCtrlID(focus), ID_HK_UP | ID_HK_DOWN | ID_HK_MUTE) {
+        let id = GetDlgCtrlID(focus);
+        if !matches!(id, ID_HK_UP | ID_HK_DOWN | ID_HK_MUTE) {
             return KeyRoute::Dialog;
         }
-        const VK_BACK: usize = 0x08;
-        const VK_RETURN: usize = 0x0D;
-        const VK_DELETE: usize = 0x2E;
-        match msg.wParam {
-            // Backspace or Delete on its own unassigns the shortcut.
-            VK_BACK | VK_DELETE if msg.message == WM_KEYDOWN && !modifier_down() => {
-                SendMessageW(focus, HKM_SETHOTKEY, 0, 0);
-                KeyRoute::Handled
-            }
-            VK_RETURN => KeyRoute::Raw,
-            _ => KeyRoute::Dialog,
+        const VK_BACK: u32 = 0x08;
+        const VK_TAB: u32 = 0x09;
+        const VK_ESCAPE: u32 = 0x1B;
+        const VK_DELETE: u32 = 0x2E;
+        let vk = msg.wParam as u32;
+        let mods = held_modifiers();
+        // Tab and Shift+Tab navigate; plain Esc closes the window. (For
+        // WM_CHAR the tab and escape characters share these codes.)
+        let navigation =
+            (vk == VK_TAB && mods & !config::MOD_SHIFT == 0) || (vk == VK_ESCAPE && mods == 0);
+        if navigation {
+            return KeyRoute::Dialog;
         }
+        if !down {
+            // Swallow the rest, so Alt combinations don't beep or open the
+            // window menu.
+            return KeyRoute::Handled;
+        }
+        let recorded = if (vk == VK_BACK || vk == VK_DELETE) && mods == 0 {
+            Some(Hotkey::NONE)
+        } else {
+            Hotkey::from_press(vk, mods)
+        };
+        if let (Some(key), Some(ui)) = (recorded, ui(settings)) {
+            if let Some(slot) = ui.hotkey(id) {
+                *slot = key;
+            }
+            SetWindowTextW(focus, wide(&shortcut_text(key)).as_ptr());
+            InvalidateRect(focus, null_mut(), 0);
+        }
+        KeyRoute::Handled
     }
 }
 
-unsafe fn modifier_down() -> bool {
+/// Modifier keys held right now, as RegisterHotKey flags.
+unsafe fn held_modifiers() -> u32 {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT,
+        GetKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
     };
-    [VK_CONTROL, VK_MENU, VK_SHIFT]
-        .iter()
-        .any(|vk| GetKeyState(*vk as i32) < 0)
+    let down = |vk: u16| GetKeyState(vk as i32) < 0;
+    let mut mods = 0;
+    if down(VK_CONTROL) {
+        mods |= config::MOD_CONTROL;
+    }
+    if down(VK_MENU) {
+        mods |= config::MOD_ALT;
+    }
+    if down(VK_SHIFT) {
+        mods |= config::MOD_SHIFT;
+    }
+    if down(VK_LWIN) || down(VK_RWIN) {
+        mods |= config::MOD_WIN;
+    }
+    mods
+}
+
+/// Shortcut text, with keys outside the built-in names ("; ' [ ]" and so
+/// on) named by the active keyboard layout.
+fn shortcut_text(key: Hotkey) -> String {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyNameTextW, MapVirtualKeyW, MAPVK_VK_TO_VSC,
+    };
+    key.describe_with(|vk| unsafe {
+        let scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+        if scan == 0 {
+            return None;
+        }
+        let mut buf = [0u16; 64];
+        let len = GetKeyNameTextW((scan << 16) as i32, buf.as_mut_ptr(), buf.len() as i32);
+        (len > 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
+    })
 }
 
 /// A channel was picked from the tray menu while this window is open: show
@@ -449,6 +506,7 @@ unsafe fn build_controls(hwnd: HWND, ui: &mut Ui) -> i32 {
     ) as HGDIOBJ;
 
     let s = ui.pending.clone();
+    ui.fields.clear();
     let row = 32;
     let field_h = 26;
     let section_gap = 42;
@@ -718,26 +776,20 @@ unsafe fn build_controls(hwnd: HWND, ui: &mut Ui) -> i32 {
     ] {
         y += row;
         label(hwnd, ui, text, right.x, y + 3, right.label_w, 0);
-        let hk = control(
+        // Drawn as a field; keys pressed while it has focus are recorded by
+        // route_key. Its text is the shortcut, which screen readers read.
+        control(
             hwnd,
             ui,
-            HOTKEY_CLASS,
-            "",
-            0,
+            "BUTTON",
+            &shortcut_text(key),
+            BS_OWNERDRAW as u32,
             right.cx(),
             y,
             right.control_w,
             field_h,
             id,
         );
-        // A bare key would hijack normal typing; promote it to Ctrl+Alt.
-        SendMessageW(
-            hk,
-            HKM_SETRULES,
-            HKCOMB_NONE | HKCOMB_S,
-            HOTKEYF_CONTROL_ALT,
-        );
-        SendMessageW(hk, HKM_SETHOTKEY, key.to_control() as WPARAM, 0);
     }
     let right_bottom = y + field_h;
 
@@ -768,14 +820,45 @@ unsafe fn build_controls(hwnd: HWND, ui: &mut Ui) -> i32 {
     ui.px(y + 34 + 20)
 }
 
+/// A text box: a painted field background with a borderless edit inset in
+/// it, which gives the text breathing room on every side.
 #[allow(clippy::too_many_arguments)]
-unsafe fn edit(parent: HWND, ui: &Ui, text: &str, numeric: bool, x: i32, y: i32, w: i32, id: i32) {
+unsafe fn edit(
+    parent: HWND,
+    ui: &mut Ui,
+    text: &str,
+    numeric: bool,
+    x: i32,
+    y: i32,
+    w: i32,
+    id: i32,
+) {
+    const FIELD_H: i32 = 26;
+    const PAD_X: i32 = 8;
+    const PAD_Y: i32 = 4;
     let style = if numeric {
         ES_NUMBER | ES_AUTOHSCROLL
     } else {
         ES_AUTOHSCROLL
     };
-    let h = control(parent, ui, "EDIT", text, style as u32, x, y, w, 26, id);
+    ui.fields.push(RECT {
+        left: ui.px(x),
+        top: ui.px(y),
+        right: ui.px(x + w),
+        bottom: ui.px(y + FIELD_H),
+    });
+    let h = control(
+        parent,
+        ui,
+        "EDIT",
+        text,
+        style as u32,
+        x + PAD_X,
+        y + PAD_Y,
+        w - PAD_X * 2,
+        FIELD_H - PAD_Y * 2,
+        id,
+    );
     themed(h, "DarkMode_CFD");
 }
 
@@ -875,12 +958,7 @@ unsafe fn repopulate(hwnd: HWND, ui: &mut Ui, s: &Settings) {
         (ID_HK_DOWN, s.hotkey_down),
         (ID_HK_MUTE, s.hotkey_mute),
     ] {
-        SendMessageW(
-            GetDlgItem(hwnd, id),
-            HKM_SETHOTKEY,
-            key.to_control() as WPARAM,
-            0,
-        );
+        SetWindowTextW(GetDlgItem(hwnd, id), wide(&shortcut_text(key)).as_ptr());
     }
     if let Some(item) = ui.channels.iter().position(|c| *c == (s.kind, s.index)) {
         SendMessageW(GetDlgItem(hwnd, ID_COMBO_CHANNEL), CB_SETCURSEL, item, 0);
@@ -966,15 +1044,8 @@ unsafe fn read_controls(hwnd: HWND, ui: &mut Ui, strict: bool) -> Result<(), Fie
         s.step_db,
         "Step per notch must be a number of dB, e.g. 1 or 0.5."
     );
-
-    for (id, slot) in [
-        (ID_HK_UP, &mut s.hotkey_up),
-        (ID_HK_DOWN, &mut s.hotkey_down),
-        (ID_HK_MUTE, &mut s.hotkey_mute),
-    ] {
-        let word = SendMessageW(GetDlgItem(hwnd, id), HKM_GETHOTKEY, 0, 0);
-        *slot = Hotkey::from_control(word as u32);
-    }
+    // Shortcuts need no reading: route_key records them straight into
+    // `pending` as they're pressed.
     Ok(())
 }
 
@@ -1159,6 +1230,22 @@ unsafe fn paint(hwnd: HWND, ui: &mut Ui) {
             tint(DIVIDER, 255),
         );
 
+        // Text box backgrounds; the edits themselves sit inset within them.
+        for rc in &ui.fields {
+            let (x, y) = (rc.left as f32, rc.top as f32);
+            let (w, h) = ((rc.right - rc.left) as f32, (rc.bottom - rc.top) as f32);
+            canvas.fill_round_rect(x, y, w, h, ui.s(6.0), tint(FIELD, 255));
+            canvas.stroke_round_rect(
+                x + 0.5,
+                y + 0.5,
+                w - 1.0,
+                h - 1.0,
+                ui.s(6.0),
+                tint(DIVIDER, 255),
+                1.0,
+            );
+        }
+
         // Preview panel with a live miniature of the bar.
         // A lighter "desktop" backdrop so the dark OSD card reads against it.
         let pr = ui.preview_rect;
@@ -1289,6 +1376,53 @@ unsafe fn draw_segment(ui: &Ui, dis: *const DRAWITEMSTRUCT, selected: bool) {
         w,
         h,
         h / 2.0,
+    );
+}
+
+/// A shortcut field: looks like the text boxes, with an accent border while
+/// it has focus, since that's when key presses are being recorded.
+unsafe fn draw_shortcut(ui: &Ui, dis: *const DRAWITEMSTRUCT) {
+    let rc = (*dis).rcItem;
+    let w = (rc.right - rc.left) as f32;
+    let h = (rc.bottom - rc.top) as f32;
+    let canvas = Canvas::from_hdc((*dis).hDC);
+    FillRect((*dis).hDC, &rc, ui.bg_brush);
+
+    let radius = ui.s(6.0);
+    let recording = (*dis).itemState & ODS_FOCUS != 0;
+    canvas.fill_round_rect(0.0, 0.0, w, h, radius, tint(FIELD, 255));
+    let (border, width) = if recording {
+        (tint(ui.accent(), 255), ui.s(1.5))
+    } else {
+        (tint(DIVIDER, 255), 1.0)
+    };
+    canvas.stroke_round_rect(0.5, 0.5, w - 1.0, h - 1.0, radius, border, width);
+
+    let label = button_label(dis);
+    let (text, color) = if recording {
+        // Replace, don't append: a long shortcut plus a hint won't fit.
+        if label == "None" {
+            ("Press a shortcut".to_string(), tint(TEXT_DIM, 255))
+        } else {
+            (label, tint(TEXT, 255))
+        }
+    } else if label == "None" {
+        (label, tint(TEXT_DIM, 255))
+    } else {
+        (label, tint(TEXT, 255))
+    };
+    // 12px here matches the text boxes: their GDI font is sized by cell
+    // height (16px), which includes internal leading, while GDI+ sizes by em.
+    canvas.draw_text(
+        &text,
+        ui.s(8.0),
+        0.0,
+        w - ui.s(16.0),
+        h,
+        ui.s(12.0),
+        color,
+        ALIGN_NEAR,
+        false,
     );
 }
 
@@ -1540,6 +1674,7 @@ pub unsafe extern "system" fn wndproc(
                 right: 0,
                 bottom: 0,
             },
+            fields: Vec::new(),
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, ui as isize);
         let height = build_controls(hwnd, &mut *ui);
@@ -1609,6 +1744,8 @@ pub unsafe extern "system" fn wndproc(
             let id = (*dis).CtlID as i32;
             if let Some((group, base, _)) = seg_group_of(id) {
                 draw_segment(ui, dis, ui.segment(group) == (id - base) as usize);
+            } else if matches!(id, ID_HK_UP | ID_HK_DOWN | ID_HK_MUTE) {
+                draw_shortcut(ui, dis);
             } else {
                 draw_button(ui, dis);
             }

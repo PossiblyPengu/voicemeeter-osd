@@ -3,14 +3,19 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/icon.ico");
+    println!("cargo:rerun-if-changed=assets/app.manifest");
     println!("cargo:rerun-if-changed=build.rs");
 
-    // comctl32 v6 gives the controls their modern themed look.
-    println!(
-        "cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' \
-         name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
-         processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
-    );
+    // Embed the application manifest (Common Controls v6, Windows 10+
+    // compatibility, per-monitor DPI). A bare /MANIFESTDEPENDENCY isn't
+    // enough: rustc doesn't ask the linker to embed a manifest, so without
+    // these the exe silently gets the old comctl32 v5 controls. Tests link
+    // too, and get the same manifest, which is harmless.
+    let manifest =
+        std::fs::canonicalize("assets/app.manifest").expect("assets/app.manifest missing");
+    let manifest = manifest.to_string_lossy().replace(r"\\?\", "");
+    println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+    println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{manifest}");
 
     let Some(rc) = find_rc() else {
         println!("cargo:warning=rc.exe not found; exe will have no embedded icon");
